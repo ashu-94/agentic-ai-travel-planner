@@ -1,0 +1,29 @@
+# Secrets
+.env
+.env.*
+*.key
+.streamlit/secrets.toml
+
+# Virtual environment
+langgraph_env3/
+venv/
+.venv/
+aviationstack-mcp/.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Logs / local DB
+*.log
+*.sqlite3
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
