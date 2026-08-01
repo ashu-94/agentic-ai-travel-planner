@@ -360,11 +360,11 @@ def flight_agent(state: TravelState):
 
     # 3. web grounding for route context
     if dep_iata and arr_iata:
-        route_query = (f"flights {dep_iata} to {arr_iata} "
-                       f"{origin} to {destination} airlines direct fare duration")
+        route_query = (f"{origin} to {destination} flight route "
+                       f"which airlines fly direct nonstop fare price")
     else:
-        route_query = (f"flights from {origin or dep_iata} to {destination} "
-                       f"airlines routes fare duration")
+        route_query = (f"{origin} to {destination} flight route "
+                       f"which airlines fly fare price")
 
     try:
         route_raw = asyncio.run(tavily_search(route_query, max_results=8))
