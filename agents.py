@@ -462,7 +462,8 @@ def hotel_agent(state: TravelState):
             "llm_calls": 1,
         }
 
-    query = f"Best hotels to stay in {city} for: {state['user_query']}"
+    style_hint = "" if style == "not specified" else f" {style}"
+    query = f"best hotels in {city}{style_hint} where to stay areas price"
 
     try:
         raw = asyncio.run(tavily_search(query, max_results=10))
