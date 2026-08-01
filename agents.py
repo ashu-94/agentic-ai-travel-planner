@@ -423,6 +423,13 @@ PROVENANCE RULES (follow strictly):
 - If a source gives a duration range whose upper bound is more than double
   the lower bound, report the shortest and typical figures instead, and note
   that longer times reflect multi-stop itineraries.
+- Sanity-check every fare's currency against the route. The origin is {origin or dep_iata}
+  and the destination is {destination}. A fare is only plausible in a currency tied to the
+  origin country, the destination country, or a major international currency (USD, EUR, GBP).
+  If a fare appears in a currency unrelated to this route (for example an India-to-Europe
+  fare quoted in Brazilian Real, Thai Baht, or similar), treat it as a scraping error:
+  do NOT report that figure. Instead say the fare could not be reliably determined from the
+  sources and point to the source link. Never repeat a fare whose currency does not fit the route.
 - Anything supported by neither source must be labelled "general knowledge".
 
 SCOPE (follow strictly):
