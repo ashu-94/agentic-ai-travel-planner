@@ -1,4 +1,4 @@
-# import psycopg
+﻿# import psycopg
 # from langgraph.checkpoint.postgres import PostgresSaver
 # from langgraph.graph import END, START, StateGraph
 
@@ -38,7 +38,7 @@
 
 
 # def route_from_supervisor(state: TravelState) -> str:
-#     # Guardrail blocked the request → skip all agents, go straight to the end
+#     # Guardrail blocked the request â†’ skip all agents, go straight to the end
 #     if not state.get("selected_agents"):
 #         return "blocked"
 #     selected = _selected_agents(state)
@@ -85,7 +85,7 @@
 #     graph.add_edge("final_response", END)
 
 #     if DATABASE_URL:
-#         conn = psycopg.connect(DATABASE_URL)
+#         conn = psycopg.connect(DATABASE_URL, auto_commit=True)
 #         checkpointer = PostgresSaver(conn)
 #         checkpointer.setup()
 #         return graph.compile(checkpointer=checkpointer)
@@ -97,7 +97,7 @@
 
 
 
-#========================================#Fan-in is automatic — when all three data agents#
+#========================================#Fan-in is automatic â€” when all three data agents#
 # write to budget_agent in the same super-step, LangGraph schedules it once, after all have finished.
 
 
@@ -186,7 +186,7 @@ def build_graph():
     graph.add_edge("final_response", END)
 
     if DATABASE_URL:
-        conn = psycopg.connect(DATABASE_URL)
+        conn = psycopg.connect(DATABASE_URL,autocommit=True)
         checkpointer = PostgresSaver(conn)
         checkpointer.setup()
         return graph.compile(checkpointer=checkpointer)

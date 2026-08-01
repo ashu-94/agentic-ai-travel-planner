@@ -1,0 +1,26 @@
+﻿# Secrets — never bake into an image
+.env
+.env.*
+
+# Virtual environments (huge, and Linux container has its own)
+langgraph_env3/
+venv/
+.venv/
+aviationstack-mcp/.venv/
+
+# Python cruft
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Git and IDE
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Docs / build artifacts not needed at runtime
+*.pdf
+*.log

@@ -1,6 +1,10 @@
 import os
+import sys
+from pathlib import Path
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
+
+_HERE = Path(__file__).parent
 
 from config import (
     AVIATION_STACK_API_KEY,
@@ -18,7 +22,7 @@ client = MultiServerMCPClient(
 
         "aviationstack": {
             "transport": "stdio",
-            "command": r"C:\Users\Ashutosh\multi_agent_system_with_guardrails\aviationstack-mcp\.venv\Scripts\python.exe",
+             "command": sys.executable,
             "args": [
                 "-m",
                 "aviationstack_mcp",
@@ -31,10 +35,8 @@ client = MultiServerMCPClient(
         }   ,
         "weather": {
             "transport": "stdio",
-            "command": r"C:\Users\Ashutosh\multi_agent_system_with_guardrails\langgraph_env3\Scripts\python.exe",
-            "args": [
-                r"C:\Users\Ashutosh\multi_agent_system_with_guardrails\weather_mcp_server.py"
-            ],
+            "command": sys.executable,
+            "args": [str(_HERE / "weather_mcp_server.py")],
             "env": {
                 "OPENWEATHER_API_KEY": OPENWEATHER_API_KEY
             }
