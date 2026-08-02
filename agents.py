@@ -2,6 +2,7 @@ import asyncio
 import json
 import random
 import time
+import re
 
 from langchain_core.messages import AIMessage,HumanMessage,SystemMessage
 from langgraph.types import interrupt
@@ -272,6 +273,73 @@ def _drop_low_quality(results):
         print(f"[filter] dropped {dropped} social/video/no-url results")
     return kept
 
+# General travel wikis never carry route-specific fare or schedule data.
+FLIGHT_BLOCKED_DOMAINS = ("wikivoyage.org", "wikipedia.org", "wikitravel.org")
+
+_FLIGHT_TERMS = ("flight", "airline", "airfare", "fare", "nonstop",
+                 "non-stop", "direct", "airport")
+
+
+# The supervisor rewrites regions to gateway cities (Goa -> Panaji), but web
+# sources name the region. Both spellings must count as the same endpoint.
+_CITY_ALIASES = {
+    "panaji": ("goa",), "srinagar": ("kashmir",), "leh": ("ladakh",),
+    "bengaluru": ("bangalore",), "bangalore": ("bengaluru",),
+    "mumbai": ("bombay", "maharashtra"), "chennai": ("madras",),
+    "kolkata": ("calcutta",), "puducherry": ("pondicherry",),
+    "thiruvananthapuram": ("trivandrum",),
+}
+
+
+def _route_relevant(results, origin, destination, dep_iata, arr_iata):
+    """Keep results about this specific route and about flying."""
+
+    def _aliases(city, iata):
+        out = set()
+        if city:
+            c = city.strip().lower()
+            out.add(c)
+            out.update(_CITY_ALIASES.get(c, ()))
+        if iata:
+            out.add(iata.strip().lower())
+        return out
+
+    def _mentions(blob, aliases):
+        for a in aliases:
+            # 3-letter tokens are IATA codes — need boundaries so GOI != going
+            if len(a) == 3 and re.search(rf"\b{re.escape(a)}\b", blob):
+                return True
+            if len(a) > 3 and a in blob:
+                return True
+        return False
+
+    dest_aliases = _aliases(destination, arr_iata)
+    orig_aliases = _aliases(origin, dep_iata)
+
+    kept = []
+    for r in results:
+        if any(d in r["url"] for d in FLIGHT_BLOCKED_DOMAINS):
+            continue
+        blob = f"{r['title']} {r['content']}".lower()
+        if not any(t in blob for t in _FLIGHT_TERMS):
+            continue
+        if dest_aliases and not _mentions(blob, dest_aliases):
+            continue
+        # Origin unknown -> destination + flight terms is the strongest test
+        # available. Don't drop everything just because we can't name a departure.
+        if orig_aliases and not _mentions(blob, orig_aliases):
+            continue
+        kept.append(r)
+
+    dropped = len(results) - len(kept)
+    if dropped:
+        print(f"[flight_agent] dropped {dropped} results not about "
+              f"{dep_iata or origin or '?'}->{arr_iata or destination or '?'}")
+    if results and not kept:
+        print("[flight_agent] WARNING: route filter removed ALL results — "
+              f"titles were: {[r['title'][:60] for r in results]}")
+    return kept
+
 
 def _resolve_iata(origin: str, destination: str) -> dict:
     """Resolve city/region names to airport IATA codes. One LLM call."""
@@ -360,8 +428,8 @@ def flight_agent(state: TravelState):
 
     # 3. web grounding for route context
     if dep_iata and arr_iata:
-        route_query = (f"{origin} to {destination} flight route "
-                       f"which airlines fly direct nonstop fare price")
+        route_query = (f"{dep_iata} to {arr_iata} flights {origin} to {destination} "
+                       f"airlines nonstop fare price")
     else:
         route_query = (f"{origin} to {destination} flight route "
                        f"which airlines fly fare price")
@@ -373,11 +441,12 @@ def flight_agent(state: TravelState):
         print(f"[flight_agent] web search failed: {e!r}")
         route_results = []
     route_results = _drop_low_quality(route_results)
+    route_results = _route_relevant(route_results, origin, destination, dep_iata, arr_iata)
 
     route_sources = "\n".join(
         f"- {r['title']} | {r['url']}\n  {r['content'][:1200]}"
         for r in route_results
-    ) or "(no web results)"
+    ) or "(no web results specific to this route)"
     print(f"[flight_agent] parsed {len(route_results)} web route results")
 
     prompt = f"""
@@ -423,6 +492,8 @@ PROVENANCE RULES (follow strictly):
 - If a source gives a duration range whose upper bound is more than double
   the lower bound, report the shortest and typical figures instead, and note
   that longer times reflect multi-stop itineraries.
+- If SOURCE B is empty, cite no URLs at all. Do not list a source in order to
+  note that it was off-topic.
 - Sanity-check every fare's currency against the route. The origin is {origin or dep_iata}
   and the destination is {destination}. A fare is only plausible in a currency tied to the
   origin country, the destination country, or a major international currency (USD, EUR, GBP).
@@ -450,6 +521,54 @@ SCOPE (follow strictly):
         "messages": [AIMessage(content="Flight agent completed.")],
         "llm_calls": 2,
     }
+
+
+
+# Nightly-rate floors, symbol-aware. Below these, a "nightly rate" scraped from
+# an aggregator page is a fragment (a tax line, a per-hour rate, a truncated
+# figure), not a room price.
+_RATE_FLOORS = {
+    "$": 15, "USD": 15,
+    "€": 15, "EUR": 15,
+    "£": 12, "GBP": 12,
+    "₹": 800, "INR": 800, "RS": 800,
+}
+
+_RATE_RE = re.compile(
+    r"(?:from\s+)?"
+    r"(?P<sym>₹|\$|€|£|INR|USD|EUR|GBP|Rs\.?)\s?"
+    r"(?P<amt>\d[\d,]*(?:\.\d+)?)"
+    r"(?P<suffix>\s*(?:per\s+night|/\s*night|a\s+night|per\s+room\s+per\s+night))?",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_hotel_prices(text: str) -> tuple[str, int]:
+    """Replace implausibly low nightly rates with an explicit uncertainty marker.
+
+    Runs on hotel_agent output before it reaches state, so the budget agent
+    never sees a number the hotel agent couldn't stand behind.
+    """
+    suppressed = []
+
+    def _repl(m):
+        sym = m.group("sym").upper().rstrip(".")
+        floor = _RATE_FLOORS.get(sym if len(sym) > 1 else m.group("sym"))
+        if floor is None:
+            return m.group(0)
+        try:
+            amount = float(m.group("amt").replace(",", ""))
+        except ValueError:
+            return m.group(0)
+        if amount >= floor:
+            return m.group(0)
+        suppressed.append(m.group(0).strip())
+        return "price not reliably determined"
+
+    cleaned = _RATE_RE.sub(_repl, text)
+    if suppressed:
+        print(f"[hotel_agent] suppressed {len(suppressed)} implausible rates: {suppressed}")
+    return cleaned, len(suppressed)
 
 def hotel_agent(state: TravelState):
     constraints = state.get("trip_constraints", {}) or {}
@@ -515,6 +634,9 @@ SELECTION RULES:
   with luxury or palace hotels.
 - If the results contain nothing that fits the stated budget, say so plainly
   rather than presenting expensive hotels as though they fit.
+- Sanity-check every rate against the destination. A nightly rate below about
+  $15 / €15 / £12 / ₹800 is a scraping artefact, not a room price. Omit the
+  price line for that hotel and write "price not reliably determined" instead.
 
 For each hotel give:
 - Hotel name (in bold)
@@ -533,6 +655,15 @@ For each hotel give:
 End with one booking tip. If fewer than 8 hotels appear, list all you found
 and say so. Clean markdown only. No raw JSON, no relevance scores.""",
     )
+
+    summary, suppressed = _sanitize_hotel_prices(summary)
+
+    if suppressed:
+        summary += (
+            f"\n\n_Note: {suppressed} nightly rate(s) in the source snippets were "
+            f"below a plausible floor for this city and have been suppressed as "
+            f"unreliable. Do not treat their absence as a low price._"
+        )
 
     return {
         "hotel_results": summary,
@@ -641,9 +772,12 @@ COSTING RULES (follow strictly):
   your own flight estimate, and do not widen or round the range.
 - Use the nightly rates given in the hotel results. Multiply by the number
   of nights in the trip duration and show that multiplication.
-- Only estimate a category when the results above contain no figure for it
-  (typically food, local transport, activities). Label every such line
-  "estimated".
+- Only estimate a category when the results above contain no figure for it AND
+  it is food, local transport, or activities. Label every such line "estimated".
+- Never estimate flights or hotels. If the results give no fare or no nightly
+  rate, that category is MISSING, not estimated. Write "not available from
+  sources", exclude it from the total, and say the total is incomplete without
+  it. Labelling an assumed hotel rate "estimated" does not make it permitted.
 - Every figure you cite must trace to the results above or be labelled
   "estimated". Never mix the two silently.
 - Your total must be the arithmetic sum of the categories you listed.
@@ -831,6 +965,9 @@ Flight options (sourced):
 Hotel options (sourced):
 {state.get('hotel_results', '')}
 
+Weather (sourced):
+{state.get('weather_results', '')}
+
 REQUIRED SECTION — day-by-day plan:
 - Preserve the full day-by-day itinerary from the draft. Every day that
   appears in the draft must appear in the final plan, with its activities.
@@ -842,6 +979,10 @@ FIGURE RULES (follow strictly):
 - If the budget notes say a cost could not be estimated, repeat that. Do not
   supply your own estimate in its place.
 - Your totals must match the budget notes' totals.
+- Do not state a feasibility verdict unless every cost you cite and the user's
+  stated budget are in the same currency. If they differ, repeat the
+  per-currency subtotals and say the comparison requires the user to convert.
+  Never write that something is "within budget" across currencies.
 
 SECTION RULES:
 - Only include a section if the corresponding results were provided above.
@@ -876,6 +1017,9 @@ Draft itinerary:
 
 Budget notes:
 {state.get('budget_results', '')}
+
+The human feedback above supersedes the draft's choices and scope. It does not
+supersede any figure: costs still come only from the budget notes.
 {sourced}
 """
     else:

@@ -198,7 +198,6 @@ async def flight_schedule(airport_iata: str, schedule_type: str = "departure",
         "number_of_flights": number_of_flights,
     })
 
-
 # ------------------------
 # OpenWeather MCP tools (custom server)
 # ------------------------
