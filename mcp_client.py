@@ -1,5 +1,8 @@
+import asyncio
 import os
+import random
 import sys
+import threading
 from pathlib import Path
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -11,58 +14,48 @@ from config import (
     OPENWEATHER_API_KEY,
     TAVILY_API_KEY,
 )
-# Create MCP Client
 
-client = MultiServerMCPClient(
-    {
-        "tavily": {
-            "transport": "streamable_http",
-            "url": f"https://mcp.tavily.com/mcp/?tavilyApiKey={TAVILY_API_KEY}"
-        },
+# ------------------------
+# MCP server configuration
+# ------------------------
 
-        "aviationstack": {
-            "transport": "stdio",
-             "command": sys.executable,
-            "args": [
-                "-m",
-                "aviationstack_mcp",
-                "mcp",
-                "run"
-            ],
-            "env": {
-                "AVIATION_STACK_API_KEY": AVIATION_STACK_API_KEY
-            }
-        }   ,
-        "weather": {
-            "transport": "stdio",
-            "command": sys.executable,
-            "args": [str(_HERE / "weather_mcp_server.py")],
-            "env": {
-                "OPENWEATHER_API_KEY": OPENWEATHER_API_KEY
-            }
-        }
+SERVERS = {
+    "tavily": {
+        "transport": "streamable_http",
+        "url": f"https://mcp.tavily.com/mcp/?tavilyApiKey={TAVILY_API_KEY}",
+    },
+    "aviationstack": {
+        "transport": "stdio",
+        "command": sys.executable,
+        "args": ["-m", "aviationstack_mcp", "mcp", "run"],
+        "env": {"AVIATION_STACK_API_KEY": AVIATION_STACK_API_KEY},
+    },
+    "weather": {
+        "transport": "stdio",
+        "command": sys.executable,
+        "args": [str(_HERE / "weather_mcp_server.py")],
+        "env": {"OPENWEATHER_API_KEY": OPENWEATHER_API_KEY},
+    },
+}
 
- 
-    }
-)
+# Kept for any code that still imports `client` directly.
+client = MultiServerMCPClient(SERVERS)
 
+# One isolated client per server. Loading them separately means a server that
+# fails to start degrades only its own capability, instead of aborting the
+# whole tool-loading step and leaving every agent with nothing.
+_server_clients = {
+    name: MultiServerMCPClient({name: cfg}) for name, cfg in SERVERS.items()
+}
 
-# Cache tools so we don't load them repeatedly
-_tools_cache = None
-
-
-
-
-import asyncio
-import random
-import threading
 
 # ------------------------
 # Reliability layer
 # ------------------------
 
-TOOL_TIMEOUT = 45          # seconds per tool call
+TOOL_TIMEOUT = 45           # seconds per tool call
 TOOL_RETRIES = 3
+SERVER_LOAD_TIMEOUT = 30    # seconds to wait for one server's tool list
 
 _RETRYABLE = (
     "timeout", "timed out", "connect", "connection", "read error",
@@ -78,34 +71,53 @@ def _error_signature(e) -> str:
     return " ".join(parts).lower()
 
 
-# Cache tools so we don't load them repeatedly.
+# server_name -> list of tools. Servers that fail are simply absent from the
+# cache and get retried on the next call, rather than poisoning it permanently.
 # threading.Lock (not asyncio.Lock) because agents are sync functions calling
 # asyncio.run(), so each runs in its own thread with its own event loop.
-_tools_cache = None
+_tools_cache: dict = {}
 _tools_lock = threading.Lock()
 
 
 async def get_tools():
-    global _tools_cache
+    """Load tools from every MCP server independently.
 
-    if _tools_cache is not None:
-        return _tools_cache
+    Each server is loaded through its own client so that one unreachable or
+    misconfigured server cannot abort the others. Returns the union of all
+    tools that loaded successfully.
+    """
+    with _tools_lock:
+        pending = [name for name in _server_clients if name not in _tools_cache]
+
+    for name in pending:
+        try:
+            tools = await asyncio.wait_for(
+                _server_clients[name].get_tools(),
+                timeout=SERVER_LOAD_TIMEOUT,
+            )
+            with _tools_lock:
+                _tools_cache[name] = tools
+            print(f"[mcp] '{name}' loaded {len(tools)} tool(s)")
+
+        except Exception as e:
+            print(
+                f"[mcp] '{name}' unavailable, continuing without it: "
+                f"{type(e).__name__}: {_error_signature(e)[:200]}"
+            )
 
     with _tools_lock:
-        if _tools_cache is not None:        # another thread won the race
-            return _tools_cache
-        try:
-            _tools_cache = await client.get_tools()
-        except Exception as e:
-            print("\n========== MCP TOOL LOAD FAILED ==========")
-            print(type(e))
-            print(repr(e))
-            for i, sub in enumerate(getattr(e, "exceptions", None) or []):
-                print(f"--- sub {i + 1} --- {type(sub)} {sub!r}")
-            print("==========================================\n")
-            raise
+        if not _tools_cache:
+            raise RuntimeError(
+                "No MCP server could be reached — check network access and "
+                "API keys for: " + ", ".join(SERVERS)
+            )
+        return [tool for tools in _tools_cache.values() for tool in tools]
 
-    return _tools_cache
+
+def available_servers() -> list:
+    """Names of MCP servers whose tools loaded successfully."""
+    with _tools_lock:
+        return sorted(_tools_cache)
 
 
 async def call_tool(tool_name: str, args: dict = None,
@@ -120,7 +132,11 @@ async def call_tool(tool_name: str, args: dict = None,
 
     tool = next((t for t in tools if t.name == tool_name), None)
     if tool is None:
-        raise ValueError(f"Tool '{tool_name}' not found")
+        up = available_servers()
+        raise ValueError(
+            f"Tool '{tool_name}' unavailable — its MCP server failed to load. "
+            f"Servers currently up: {', '.join(up) if up else 'none'}"
+        )
 
     last_error = None
 
@@ -150,17 +166,21 @@ async def call_tool(tool_name: str, args: dict = None,
     print(f"[call_tool] {tool_name} failed after {retries} attempts: {last_error!r}")
     raise last_error
 
-# ------------------------
-# Tavily MCP Tools
-# ------------------------
 
-
+# ------------------------
+# Tavily MCP tools
+# ------------------------
 
 async def tavily_search(query: str, max_results: int = 10):
     return await call_tool(
         "tavily_search",
         {"query": query, "max_results": max_results},
     )
+
+
+# ------------------------
+# AviationStack MCP tools
+# ------------------------
 
 async def list_airports(search: str = "", limit: int = 10):
     return await call_tool("list_airports", {"search": search, "limit": limit, "offset": 0})
@@ -170,13 +190,6 @@ async def list_airlines(search: str = "", limit: int = 10):
     return await call_tool("list_airlines", {"search": search, "limit": limit, "offset": 0})
 
 
-async def current_weather(city: str):
-    return await call_tool("get_current_weather", {"city": city})
-
-async def forecast(city: str):
-    return await call_tool("get_forecast", {"city": city})
-
-
 async def flight_schedule(airport_iata: str, schedule_type: str = "departure",
                           number_of_flights: int = 40):
     return await call_tool("flight_arrival_departure_schedule", {
@@ -184,3 +197,15 @@ async def flight_schedule(airport_iata: str, schedule_type: str = "departure",
         "schedule_type": schedule_type,
         "number_of_flights": number_of_flights,
     })
+
+
+# ------------------------
+# OpenWeather MCP tools (custom server)
+# ------------------------
+
+async def current_weather(city: str):
+    return await call_tool("get_current_weather", {"city": city})
+
+
+async def forecast(city: str):
+    return await call_tool("get_forecast", {"city": city})
