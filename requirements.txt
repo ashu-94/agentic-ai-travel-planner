@@ -15,4 +15,3 @@ requests
 streamlit>=1.40
 reportlab
 markdown
-./aviationstack-mcp
