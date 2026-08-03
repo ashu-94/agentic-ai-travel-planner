@@ -2,6 +2,7 @@ import base64
 import html
 import io
 import re
+import traceback
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -896,10 +897,10 @@ if run:
             st.session_state.waiting_for_approval = "__interrupt__" in result
 
         except Exception as e:
-            print(f"[frontend] planning failed: {e!r}")
-            st.error(explain_failure(e))
-            st.stop()
 
+          traceback.print_exc()
+          st.exception(e)
+          raise
 
 result = st.session_state.get("latest_result")
 
@@ -1022,10 +1023,11 @@ if st.session_state.get("waiting_for_approval"):
             st.rerun()
 
         except Exception as e:
-            print(f"[frontend] review failed: {e!r}")
+            traceback.print_exc()
             st.error(explain_failure(e))
             st.caption("Your draft is still saved. Send the review again once "
                        "the issue clears.")
+            
 
 
 # --------------------------------------------------------- final + downloads
